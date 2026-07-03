@@ -16,6 +16,12 @@ const crypto = require("crypto");
 
 const SUMMARY_MARKER = "<!-- ocr-summary -->";
 
+// Default IoU threshold for the incremental multi-line overlap test. Two
+// multi-line comments are considered the same when their line-range
+// intersection-over-union exceeds this value. Exposed for tuning via the
+// incrementalOverlapThreshold option / incremental_overlap_threshold input.
+const DEFAULT_OVERLAP_THRESHOLD = 0.6;
+
 async function runPostReviewComments({
   github,
   context,
@@ -25,6 +31,7 @@ async function runPostReviewComments({
   stderrPath = "/tmp/ocr-stderr.log",
   stickySummary = true,
   incremental = false,
+  incrementalOverlapThreshold = DEFAULT_OVERLAP_THRESHOLD,
 }) {
   const log = (msg) => {
     if (core && typeof core.info === "function") core.info(msg);
@@ -142,7 +149,9 @@ async function runPostReviewComments({
     const existing = await listExistingReviewComments(github, owner, repo, prNumber, log);
     const botLogin = await getAuthenticatedLogin(github, log);
     const hist = existing.filter((c) => isBotComment(c, botLogin));
-    toSend = reviewComments.filter(({ reviewComment }) => !overlapsHistory(reviewComment, hist));
+    toSend = reviewComments.filter(
+      ({ reviewComment }) => !overlapsHistory(reviewComment, hist, incrementalOverlapThreshold)
+    );
     stats.skipped = reviewComments.length - toSend.length;
     if (stats.skipped > 0) {
       log(`[incremental] skipped ${stats.skipped} overlapping comment(s); ${toSend.length} to post.`);
@@ -637,20 +646,68 @@ function isBotComment(comment, botLogin) {
   return /github-actions\[bot\]$/i.test(login) || (botLogin != null && login === botLogin);
 }
 
-// Overlap test: same path, line ranges intersect, and on the RIGHT side
-// (the bot only ever posts RIGHT-side comments).
-function overlapsHistory(reviewComment, history) {
+// Incremental overlap test. The current comment is considered a duplicate of
+// an existing bot comment (and thus skipped) when they target the same path
+// and RIGHT side AND one of these holds:
+//   1. both are single-line comments on the same line;
+//   2. both are multi-line comments whose line-range IoU (intersection over
+//      union) exceeds `threshold`.
+// A single-line comment is NEVER considered the same as a multi-line one, so
+// revisiting a line with a finer-grained single-line note is not suppressed by
+// a prior multi-line block (and vice versa).
+function overlapsHistory(reviewComment, history, threshold = DEFAULT_OVERLAP_THRESHOLD) {
+  const t = resolveThreshold(threshold);
   const path = reviewComment.path;
-  const cur = rangeOf(reviewComment);
+  const cur = lineSpan(reviewComment);
   if (!cur) return false;
   for (const h of history) {
     if (h.path !== path) continue;
     if (h.side && h.side !== "RIGHT") continue;
-    const hr = rangeOf(h);
-    if (!hr) continue;
-    if (cur[0] <= hr[1] && hr[0] <= cur[1]) return true;
+    const other = lineSpan(h);
+    if (!other) continue;
+    if (sameCommentSpan(cur, other, t)) return true;
   }
   return false;
+}
+
+// Clamp/validate the caller-provided threshold to a sane (0, 1] number,
+// falling back to the default when it is missing, NaN, or out of range. This
+// keeps the public overlapsHistory API robust even when the value arrives from
+// an env var / action input as a malformed string.
+function resolveThreshold(threshold) {
+  const n = Number(threshold);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : DEFAULT_OVERLAP_THRESHOLD;
+}
+
+// Resolve a comment into a line span tagged as single- or multi-line.
+// Returns { start, end, multiline } or null when no line can be resolved.
+// Handles both our own reviewComment shape ({start_line, line}) and GitHub's
+// historical comment shape ({start_line, line}; start_line null for
+// single-line). A comment is multi-line only when start_line and line are both
+// present and differ; start_line === line (or a missing start_line) is treated
+// as a single-line comment on that line.
+function lineSpan(c) {
+  const start = num(c.start_line);
+  const end = num(c.line != null ? c.line : c.end_line);
+  if (start == null && end == null) return null;
+  if (start != null && end != null && start !== end) {
+    return { start: Math.min(start, end), end: Math.max(start, end), multiline: true };
+  }
+  const single = end != null ? end : start;
+  return { start: single, end: single, multiline: false };
+}
+
+// Same-comment predicate implementing the incremental rules. The IoU
+// comparison is strict (>), so a span that exactly meets the threshold is NOT
+// treated as a duplicate.
+function sameCommentSpan(cur, other, threshold) {
+  if (cur.multiline !== other.multiline) return false;
+  if (!cur.multiline) return cur.start === other.start;
+  const overlap = Math.min(cur.end, other.end) - Math.max(cur.start, other.start) + 1;
+  if (overlap <= 0) return false;
+  const union = cur.end - cur.start + 1 + (other.end - other.start + 1) - overlap;
+  if (union <= 0) return false;
+  return overlap / union > threshold;
 }
 
 // Returns [start, end] inclusive line range, or null if not resolvable.
@@ -1094,6 +1151,9 @@ module.exports = {
   getAuthenticatedLogin,
   isBotComment,
   overlapsHistory,
+  lineSpan,
+  sameCommentSpan,
+  resolveThreshold,
   rangeOf,
   computeRetryDelayMs,
   getHeader,

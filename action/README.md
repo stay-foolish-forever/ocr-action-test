@@ -82,6 +82,7 @@ For `issue_comment` triggers, resolve the PR context first and pass it in:
 | `upload_artifacts` | no | `true` | upload JSON + stderr artifacts |
 | `sticky_summary` | no | `true` | summary dimension: update existing summary in place |
 | `incremental` | no | `false` | incremental dimension: only append comments not overlapping history |
+| `incremental_overlap_threshold` | no | `0.6` | IoU threshold for multi-line overlap in incremental mode; single-line matches on same line, single- vs multi-line never matches |
 | `base_ref` | no | — | override base ref (comment triggers) |
 | `head_sha` | no | — | override head SHA (comment triggers) |
 | `node_version` | no | `24` | Node.js version |

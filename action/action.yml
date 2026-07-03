@@ -72,6 +72,14 @@ inputs:
       never deleted (non-destructive).
     required: false
     default: 'false'
+  incremental_overlap_threshold:
+    description: >-
+      IoU (intersection-over-union) threshold used by incremental mode to decide
+      whether a new multi-line comment overlaps an existing one. Two single-line
+      comments match when on the same line; single- vs multi-line never match.
+      Value in (0, 1]; ignored unless incremental is true.
+    required: false
+    default: '0.6'
   base_ref:
     description: >-
       Override the base ref. Provide this (and head_sha) when invoking from a
@@ -220,4 +228,5 @@ runs:
             stderrPath: '/tmp/ocr-stderr.log',
             stickySummary: ${{ inputs.sticky_summary == 'true' }},
             incremental: ${{ inputs.incremental == 'true' }},
+            incrementalOverlapThreshold: parseFloat('${{ inputs.incremental_overlap_threshold }}'),
           });

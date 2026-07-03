@@ -12,7 +12,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, rangeOf, overlapsHistory, newCommentId, getPostedCommentIds, computeRetryDelayMs } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, rangeOf, lineSpan, sameCommentSpan, overlapsHistory, newCommentId, getPostedCommentIds, computeRetryDelayMs } = require(path.join(__dirname, "post-review-comments.js"));
 
 // Make all retry/pacing delays effectively zero so tests run fast.
 // NOTE: computeRetryDelayMs reads OCR_RETRY_MAX_DELAY / OCR_RETRY_BASE_DELAY
@@ -1071,14 +1071,56 @@ function testRangeOf() {
   assert.strictEqual(rangeOf({}), null);
 }
 
+function testLineSpan() {
+  assert.deepStrictEqual(lineSpan({ line: 10, start_line: 5 }), { start: 5, end: 10, multiline: true });
+  assert.deepStrictEqual(lineSpan({ line: 7 }), { start: 7, end: 7, multiline: false });
+  assert.deepStrictEqual(lineSpan({ start_line: 3 }), { start: 3, end: 3, multiline: false });
+  // start_line === line collapses to a single-line span.
+  assert.deepStrictEqual(lineSpan({ line: 9, start_line: 9 }), { start: 9, end: 9, multiline: false });
+  assert.strictEqual(lineSpan({}), null);
+}
+
+function testSameCommentSpan() {
+  const sl = (n) => ({ start: n, end: n, multiline: false });
+  const ml = (a, b) => ({ start: a, end: b, multiline: true });
+  // Rule 1: single vs multi never match.
+  assert.strictEqual(sameCommentSpan(sl(9), ml(8, 10), 0.6), false);
+  assert.strictEqual(sameCommentSpan(ml(8, 10), sl(9), 0.6), false);
+  // Rule 2: single-line, same line matches; different line does not.
+  assert.strictEqual(sameCommentSpan(sl(9), sl(9), 0.6), true);
+  assert.strictEqual(sameCommentSpan(sl(9), sl(10), 0.6), false);
+  // Rule 3: multi-line IoU. [8,10] vs [9,11] => overlap 2 / union 4 = 0.5.
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(9, 11), 0.6), false);
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(9, 11), 0.4), true);
+  // [8,10] vs [8,9] => overlap 2 / union 3 ~= 0.67.
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(8, 9), 0.6), true);
+  // Identical spans => IoU 1.
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(8, 10), 0.6), true);
+  // Disjoint multi-line spans never match.
+  assert.strictEqual(sameCommentSpan(ml(1, 3), ml(8, 10), 0.6), false);
+  // IoU comparison is strict: exactly at the threshold is NOT a match.
+  // [8,10] vs [9,11] => IoU 0.5; threshold 0.5 => 0.5 > 0.5 is false.
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(9, 11), 0.5), false);
+}
+
 function testOverlapsHistory() {
-  const hist = [{ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }];
-  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 9, side: "RIGHT" }, hist), true);
-  assert.strictEqual(overlapsHistory({ path: "a.js", line: 20, start_line: 20, side: "RIGHT" }, hist), false);
-  assert.strictEqual(overlapsHistory({ path: "b.js", line: 10, start_line: 10, side: "RIGHT" }, hist), false);
-  // LEFT-side history is ignored (bot only posts RIGHT).
-  const leftHist = [{ path: "a.js", line: 10, start_line: 10, side: "LEFT" }];
-  assert.strictEqual(overlapsHistory({ path: "a.js", line: 10, start_line: 10, side: "RIGHT" }, leftHist), false);
+  // Rule 2: single-line, same line => overlap; different line => no overlap.
+  const sl = [{ path: "a.js", line: 9, side: "RIGHT" }];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 9, side: "RIGHT" }, sl), true);
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 20, start_line: 20, side: "RIGHT" }, sl), false);
+  // Rule 1: single-line vs multi-line never overlap.
+  const ml = [{ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 9, side: "RIGHT" }, ml), false);
+  // Rule 3: multi-line IoU vs default threshold 0.6.
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }, ml), true);
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 11, start_line: 9, side: "RIGHT" }, ml), false);
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 8, side: "RIGHT" }, ml), true);
+  // Threshold argument lowers the bar (IoU 0.5 > 0.4).
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 11, start_line: 9, side: "RIGHT" }, ml, 0.4), true);
+  // Different path and LEFT-side history are still ignored.
+  assert.strictEqual(overlapsHistory({ path: "b.js", line: 10, start_line: 8, side: "RIGHT" }, ml), false);
+  const leftHist = [{ path: "a.js", line: 10, start_line: 8, side: "LEFT" }];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }, leftHist), false);
 }
 
 async function main() {
@@ -1113,6 +1155,8 @@ async function main() {
   // Pure helpers
   testSafeFenceAndFencedBlock();
   testRangeOf();
+  testLineSpan();
+  testSameCommentSpan();
   testOverlapsHistory();
   testNewCommentIdFormat();
   console.log("All post-review-comments tests passed.");
