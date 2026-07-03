@@ -90,6 +90,10 @@ function makeGithub(opts = {}) {
   const listCommentsCalls = [];
   const listReviewCommentsCalls = [];
   const listReviewsCalls = [];
+  // Interleaved log of write operations (createReview / createComment /
+  // updateComment) in call order, so tests can assert positioning invariants
+  // such as "summary created before review" without timing the calls.
+  const ops = [];
   // Per-comment attempt counter, keyed by commentKey, so perCommentError can be
   // attempt-aware (e.g. "429 on attempt 0, succeed on attempt 1").
   const perCommentAttempts = new Map();
@@ -130,6 +134,7 @@ function makeGithub(opts = {}) {
     listCommentsCalls,
     listReviewCommentsCalls,
     listReviewsCalls,
+    ops,
     rest: {
       users: {
         getAuthenticated: async () => ({ data: { login: "github-actions[bot]" } }),
@@ -138,6 +143,7 @@ function makeGithub(opts = {}) {
         get: async () => ({ data: { head: { sha: "head-sha" } } }),
         createReview: async (params) => {
           createReviewCalls.push(params);
+          ops.push({ type: "createReview", params });
           const callIdx = createReviewCalls.length - 1;
           const successRes = () => ({ data: {}, headers: { "x-ratelimit-remaining": successRemaining() } });
           if (callIdx === 0) {
@@ -233,10 +239,12 @@ function makeGithub(opts = {}) {
         },
         createComment: async (params) => {
           issueComments.push(params);
+          ops.push({ type: "createComment", params });
           return { data: { id: 1000 + issueComments.length, html_url: `http://ex/c${issueComments.length}` } };
         },
         updateComment: async (params) => {
           updatedComments.push(params);
+          ops.push({ type: "updateComment", params });
           return { data: { id: params.comment_id, html_url: `http://ex/u${updatedComments.length}` } };
         },
       },
@@ -307,9 +315,9 @@ async function testFailedInlineCommentsAreSummarized() {
   });
 
   assert.strictEqual(github.createReviewCalls.length, 2, "bulk + one per-comment attempt");
-  assert.strictEqual(github.issueComments.length, 1, "sticky summary created (no existing)");
-  assert.strictEqual(github.updatedComments.length, 0);
-  const body = github.issueComments[0].body;
+  assert.strictEqual(github.issueComments.length, 1, "summary anchor created (no existing)");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with the full body");
+  const body = github.updatedComments[0].body;
   assert.match(body, /No-line content with a fenced block/);
   assert.match(body, /Failed inline content must remain visible/);
   assert.match(body, /Line could not be resolved/);
@@ -347,10 +355,9 @@ async function testStickyUpdatesExistingSummary() {
 }
 
 // Non-sticky + batch fails (e.g. rate-limit) but the per-comment fallback then
-// succeeds for every comment. The summary was meant to ride in the batch review
-// body, which never landed, so a separate summary issue comment MUST still be
-// posted. Regression guard: previously failedCount===0 made the code think the
-// batch carried the summary and skip the separate comment, losing the summary.
+// succeeds for every comment. The summary must still be posted as its own issue
+// comment (the summary never rides in the review body anymore) and finalized
+// with the success statistics.
 async function testNonStickyFallbackAllSuccessStillPostsSummary() {
   const result = { comments: [{ path: "src/a.js", content: "comment A", start_line: 1, end_line: 1 }], warnings: [] };
 
@@ -367,8 +374,8 @@ async function testNonStickyFallbackAllSuccessStillPostsSummary() {
 
   // batch (call #1, failed) + one per-comment retry (call #2, succeeded).
   assert.strictEqual(github.createReviewCalls.length, 2, "batch + per-comment fallback");
-  assert.strictEqual(github.issueComments.length, 1, "summary still posted as issue comment since batch body never landed");
-  assert.strictEqual(github.updatedComments.length, 0, "non-sticky never updates");
+  assert.strictEqual(github.issueComments.length, 1, "summary anchor posted as issue comment");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with the success stats");
   assert.strictEqual(outputs.comments_inline, "1");
   assert.strictEqual(outputs.comments_failed, "0");
 }
@@ -385,9 +392,9 @@ async function testNonStickyCreatesNewCommentOnFallback() {
     opts: { stickySummary: false },
   });
 
-  assert.strictEqual(github.issueComments.length, 1, "fallback posts a new summary comment");
-  assert.strictEqual(github.updatedComments.length, 0, "non-sticky never updates");
-  assert.match(github.issueComments[0].body, /Failed inline content/);
+  assert.strictEqual(github.issueComments.length, 1, "anchor summary comment created");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with full body");
+  assert.match(github.updatedComments[0].body, /Failed inline content/);
 }
 
 async function testNoCommentsStickyUpdate() {
@@ -440,8 +447,9 @@ async function testIncrementalAllOverlapPostsNoReview() {
   });
 
   assert.strictEqual(github.createReviewCalls.length, 0, "no review posted");
-  assert.strictEqual(github.issueComments.length, 1, "sticky summary created");
-  assert.match(github.issueComments[0].body, /nothing new was posted/);
+  assert.strictEqual(github.issueComments.length, 1, "summary anchor created");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with status body");
+  assert.match(github.updatedComments[0].body, /nothing new was posted/);
   assert.strictEqual(outputs.comments_skipped, "1");
   assert.strictEqual(outputs.comments_inline, "0");
 }
@@ -536,18 +544,22 @@ async function testPerComment5xxIdempotencyUnavailableSkipsRetry() {
   // (unknown -> skip to avoid duplicate).
   assert.strictEqual(github.createReviewCalls.length, 2, "no retry when idempotency check is unavailable");
   assert.strictEqual(outputs.comments_failed, "1", "recorded as failed, not retried");
-  // The uncertainty is surfaced in the summary.
-  assert.strictEqual(github.issueComments.length, 1);
-  assert.match(github.issueComments[0].body, /idempotency check unavailable/);
+  // The uncertainty is surfaced in the finalized summary.
+  assert.strictEqual(github.issueComments.length, 1, "anchor created");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized");
+  assert.match(github.updatedComments[0].body, /idempotency check unavailable/);
 }
 
-// A summary comment with this run's tag already exists (e.g. a previous
-// attempt within the run posted it). Posting must be skipped to avoid a
-// duplicate summary.
-async function testSummaryDedupSkipsWhenRunTagAlreadyPosted() {
+// A summary comment already exists (e.g. a previous attempt within the run
+// posted it). The anchor phase must reuse it (no duplicate created) and the
+// finalize phase must refresh it in place with the final body.
+async function testSummaryDoesNotDuplicateWhenAlreadyPosted() {
   // context.runId/runAttempt are unset -> RUN_TAG = "0-1" -> SUMMARY_TAG =
-  // "<!-- ocr-summary-run:0-1 -->".
-  const existing = [{ id: 5, body: "<!-- ocr-summary-run:0-1 -->\nold summary", user: { login: "github-actions[bot]" } }];
+  // "<!-- ocr-summary-run:0-1 -->". A real summary carries both the persistent
+  // SUMMARY_MARKER and the per-run SUMMARY_TAG.
+  const existing = [
+    { id: 5, body: "<!-- ocr-summary -->\n<!-- ocr-summary-run:0-1 -->\nold summary", user: { login: "github-actions[bot]" } },
+  ];
   const result = { comments: [{ path: "src/a.js", content: "x", start_line: 1, end_line: 1 }], warnings: [] };
 
   const { github, outputs } = await run({
@@ -556,12 +568,60 @@ async function testSummaryDedupSkipsWhenRunTagAlreadyPosted() {
     opts: { stickySummary: true },
   });
 
-  // Batch review posted normally; summary skipped (already exists for this run).
+  // Batch review posted normally; the existing summary is reused and refreshed,
+  // never duplicated.
   assert.strictEqual(github.createReviewCalls.length, 1, "batch review posted");
   assert.strictEqual(github.issueComments.length, 0, "no duplicate summary created");
-  assert.strictEqual(github.updatedComments.length, 0, "no summary update either (skipped)");
+  assert.strictEqual(github.updatedComments.length, 1, "existing summary refreshed in place");
+  assert.strictEqual(github.updatedComments[0].comment_id, 5, "the existing comment is the one updated");
   assert.strictEqual(outputs.comments_inline, "1");
-  assert.strictEqual(outputs.summary_comment_url, "", "no summary url since skipped");
+  assert.strictEqual(outputs.summary_comment_url, "http://ex/u1");
+  assert.match(github.updatedComments[0].body, /Successfully posted: 1 comment/, "final body reflects the run outcome");
+}
+
+// Cold-start ordering: on the first review on a PR, the summary issue comment
+// must be created BEFORE the batch review so its timeline position is above the
+// review (GitHub orders issue comments oldest-first). It is then finalized
+// (updated in place) after the review lands. This is the core fix for the
+// "summary sandwiched between review blocks" defect on sticky PRs.
+async function testSummaryAnchorCreatedBeforeReviewColdStart() {
+  const result = { comments: [{ path: "src/a.js", content: "x", start_line: 1, end_line: 1 }], warnings: [] };
+
+  const { github } = await run({
+    result,
+    githubOpts: { existingSummary: [] }, // cold start: no existing summary
+    opts: { stickySummary: true },
+  });
+
+  const types = github.ops.map((o) => o.type);
+  const anchorIdx = types.indexOf("createComment");
+  const reviewIdx = types.indexOf("createReview");
+  const finalizeIdx = types.lastIndexOf("updateComment");
+  assert.notStrictEqual(anchorIdx, -1, "summary anchor created");
+  assert.notStrictEqual(reviewIdx, -1, "batch review posted");
+  assert.notStrictEqual(finalizeIdx, -1, "summary finalized");
+  assert.ok(anchorIdx < reviewIdx, "summary anchor created BEFORE the review (cold-start positioning)");
+  assert.ok(reviewIdx < finalizeIdx, "summary finalized AFTER the review");
+  // The anchor body is a pre-review placeholder; the final body carries stats.
+  assert.match(github.issueComments[0].body, /Posting review comments/);
+  assert.match(github.updatedComments[0].body, /Successfully posted: 1 comment/);
+}
+
+// Cold start + non-sticky: the per-run summary is also anchored before the
+// review (non-sticky still creates a fresh comment each run, but within the run
+// it must lead the review for a natural reading order).
+async function testSummaryAnchorCreatedBeforeReviewNonSticky() {
+  const result = { comments: [{ path: "src/a.js", content: "x", start_line: 1, end_line: 1 }], warnings: [] };
+
+  const { github } = await run({
+    result,
+    githubOpts: { existingSummary: [] },
+    opts: { stickySummary: false },
+  });
+
+  const types = github.ops.map((o) => o.type);
+  assert.ok(types.indexOf("createComment") < types.indexOf("createReview"), "anchor before review");
+  assert.ok(types.indexOf("createReview") < types.lastIndexOf("updateComment"), "finalize after review");
 }
 
 function testNewCommentIdFormat() {
@@ -721,9 +781,10 @@ async function testBatchRateLimitWithPartialInvalidContent() {
   // be skipped entirely (no listReviews / listReviewComments).
   assert.strictEqual(github.listReviewsCalls.length, 0, "429 batch skips listReviews idempotency read");
   assert.strictEqual(github.listReviewCommentsCalls.length, 0, "no per-comment idempotency reads (422 non-retryable, successes need none)");
-  // Summary surfaces ONLY the failed comment.
-  assert.strictEqual(github.issueComments.length, 1);
-  const body = github.issueComments[0].body;
+  // Summary surfaces ONLY the failed comment (in the finalized body).
+  assert.strictEqual(github.issueComments.length, 1, "anchor created");
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized");
+  const body = github.updatedComments[0].body;
   assert.match(body, /invalid B/, "failed comment content appears in summary");
   assert.doesNotMatch(body, /valid A/, "successful comment not duplicated into summary");
   assert.doesNotMatch(body, /valid C/, "successful comment not duplicated into summary");
@@ -1033,7 +1094,9 @@ async function main() {
   await testBatchLandedRetriesOnlyMissingComments();
   await testPerComment5xxAlreadyPostedTreatedAsSuccess();
   await testPerComment5xxIdempotencyUnavailableSkipsRetry();
-  await testSummaryDedupSkipsWhenRunTagAlreadyPosted();
+  await testSummaryDoesNotDuplicateWhenAlreadyPosted();
+  await testSummaryAnchorCreatedBeforeReviewColdStart();
+  await testSummaryAnchorCreatedBeforeReviewNonSticky();
   await testGetPostedCommentIdsExtractsEmbeddedIds();
   // Rate-limit strategy (pure function)
   testComputeRetryDelayMs();

@@ -149,29 +149,39 @@ async function runPostReviewComments({
     }
   }
 
+  // ---- Summary anchor (before the review) ----
+  // Create the summary issue comment BEFORE posting the review so that on a
+  // cold start (the first review on this PR) the summary's timeline position is
+  // above the review. GitHub orders issue comments oldest-first, so creating
+  // the summary first pins it at the top; later runs merely update it in place
+  // (sticky) or post a fresh per-run comment (non-sticky), so the ordering
+  // stays stable and the summary is never sandwiched between review blocks.
+  // The anchor carries a pre-review body (issue count, warnings, and comments
+  // without line info — all known upfront); final posting statistics are
+  // written in the finalize phase below, once the review has landed.
+  const wrapSummary = (content) => `${SUMMARY_MARKER}\n${SUMMARY_TAG}\n${content}`;
+  const anchor = await ensureSummaryAnchor({
+    github,
+    owner,
+    repo,
+    prNumber,
+    sticky: stickySummary,
+    tag: SUMMARY_TAG,
+    body: wrapSummary(buildPreReviewSummaryBody(stats.total, commentsWithoutLine, warnings)),
+    log,
+  });
+
   // Submit inline comments (the to-send set) as a single PR review.
   let successCount = 0;
   let failedCount = 0;
   const failedComments = [];
-  // True only when the single batch createReview (which, in non-sticky mode,
-  // carries the summary in its body) actually landed. Distinct from "all inline
-  // comments eventually posted": a batch may fail (e.g. rate-limit) while the
-  // per-comment fallback then succeeds, in which case the summary body never
-  // landed and a separate summary comment is still required.
-  let batchReviewSucceeded = false;
 
   if (toSend.length > 0) {
-    // When sticky, the summary lives in an updatable issue comment, so the
-    // review body carries only the per-run REVIEW_TAG. When non-sticky, keep
-    // legacy behavior: carry the summary in the review body. In both cases the
-    // REVIEW_TAG is prepended so the idempotency check can locate the batch
-    // review on retry (a batch createReview may have landed on the server even
-    // though we received a 5xx response).
-    const reviewBodyBase = stickySummary
-      ? ""
-      : buildSummaryBody(stats.total, toSend.length, commentsWithoutLine.length, warnings) +
-        formatSummaryComments(commentsWithoutLine);
-    const reviewBody = reviewBodyBase ? `${REVIEW_TAG}\n${reviewBodyBase}` : REVIEW_TAG;
+    // The summary lives in its own issue comment (anchored above), so the
+    // review body carries only the per-run REVIEW_TAG. The tag lets the
+    // idempotency check locate the batch review on retry (a batch createReview
+    // may have landed on the server even though we received a 5xx response).
+    const reviewBody = REVIEW_TAG;
 
     try {
       const batchRes = await github.rest.pulls.createReview({
@@ -184,7 +194,6 @@ async function runPostReviewComments({
         comments: toSend.map(({ reviewComment }) => reviewComment),
       });
       successCount = toSend.length;
-      batchReviewSucceeded = true;
       log(`Successfully posted review with ${successCount} inline comment(s) (${commentsWithoutLine.length} in summary).`);
       logRateLimitQuota(batchRes, "after batch createReview", log);
     } catch (e) {
@@ -387,10 +396,10 @@ async function runPostReviewComments({
   stats.inline = successCount;
   stats.failed = failedCount;
 
-  // Build the summary body. When non-sticky and the batch succeeded, the
-  // summary was already carried in the review body; only post a separate
-  // issue comment when there is extra content (failed/no-line/incremental
-  // stats) to surface.
+  // ---- Finalize the summary with the complete body ----
+  // Now that the review has landed (or failed per-comment), write the final
+  // summary body: inline/skipped/failed counts and any comments that could not
+  // be posted inline (so they remain visible in the summary).
   let summaryBody = buildSummaryBody(stats.total, successCount, commentsWithoutLine.length + failedComments.length, warnings);
   summaryBody += formatSummaryComments(commentsWithoutLine);
 
@@ -402,50 +411,37 @@ async function runPostReviewComments({
   if (failedCount > 0) {
     extraStats.push(`\n- ❌ Failed to post: ${failedCount} comment(s)`);
   }
-
-  // Non-sticky legacy behavior: the summary rides in the batch review body, so
-  // a separate issue comment is needed only when that batch did NOT land
-  // (sticky, fallback after batch failure, or no inline to attach the body to).
-  // Note this keys off batchReviewSucceeded, not failedCount: a batch may fail
-  // (e.g. rate-limit) while the per-comment fallback then succeeds (failedCount
-  // stays 0), in which case the summary body was never posted and must be
-  // recovered via a separate comment.
-  const batchSucceededWithInline = batchReviewSucceeded && toSend.length > 0;
-  const needsSeparateSummary = stickySummary || !batchSucceededWithInline;
-
-  if (needsSeparateSummary) {
-    if (extraStats.length > 0) {
-      summaryBody += `\n\n---\n\n📊 **Posting Statistics:**` + extraStats.join("");
-    }
-    if (failedComments.length > 0) {
-      summaryBody += "\n\n---\n\n### ⚠️ Inline comments shown in summary";
-      for (const { comment, error } of failedComments) {
-        summaryBody += "\n\n---\n\n";
-        summaryBody += formatCommentMarkdown(comment, error);
-      }
-    }
-    if (toSend.length === 0 && stats.skipped > 0) {
-      summaryBody += "\n\n---\n\nℹ️ All inline comments overlapped with existing reviews; nothing new was posted.";
-    }
-    // Prepend the per-run summary tag so the idempotency check can detect
-    // whether a summary with this run tag already exists (a previous attempt
-    // within the run may have posted it, or the batch review may have carried
-    // the same summary). Skip posting if it already exists or cannot be
-    // verified, to avoid producing a duplicate summary comment.
-    const taggedBody = `${SUMMARY_TAG}\n${summaryBody}`;
-    const summaryAlreadyPosted = await hasIssueCommentWithId({ github, owner, repo, issueNumber: prNumber, id: SUMMARY_TAG, log });
-    if (summaryAlreadyPosted === true) {
-      log("Summary comment with this run tag already exists; skipping.");
-    } else if (summaryAlreadyPosted === null) {
-      // Read API unavailable: cannot tell whether the summary already landed.
-      // Skip posting to avoid a duplicate; the review content is still
-      // available via inline comments / batch review.
-      log("Cannot verify whether summary comment already exists (read API failed); skipping to avoid duplicate.");
-    } else {
-      const posted = await postSummary({ github, owner, repo, prNumber, body: taggedBody, sticky: stickySummary });
-      stats.summaryUrl = posted.url;
+  if (extraStats.length > 0) {
+    summaryBody += `\n\n---\n\n📊 **Posting Statistics:**` + extraStats.join("");
+  }
+  if (failedComments.length > 0) {
+    summaryBody += "\n\n---\n\n### ⚠️ Inline comments shown in summary";
+    for (const { comment, error } of failedComments) {
+      summaryBody += "\n\n---\n\n";
+      summaryBody += formatCommentMarkdown(comment, error);
     }
   }
+  if (toSend.length === 0 && stats.skipped > 0) {
+    summaryBody += "\n\n---\n\nℹ️ All inline comments overlapped with existing reviews; nothing new was posted.";
+  }
+
+  // Update the anchored comment directly when its id is known (no extra read);
+  // otherwise upsert (find-then-update-or-create), which also covers the case
+  // where the anchor phase was skipped because the read API was unavailable.
+  // Returns null only when the summary could not be written without risking a
+  // duplicate; the review content remains available via inline comments.
+  const finalized = await finalizeSummary({
+    github,
+    owner,
+    repo,
+    prNumber,
+    anchor,
+    sticky: stickySummary,
+    tag: SUMMARY_TAG,
+    body: wrapSummary(summaryBody),
+    log,
+  });
+  if (finalized) stats.summaryUrl = finalized.url;
 
   setStatsOutputs(out, stats);
 }
@@ -498,6 +494,94 @@ async function findExistingSummaryComment(github, owner, repo, prNumber) {
     }
   }
   return null;
+}
+
+// ---- Summary anchor + finalize (cold-start ordering) ----
+//
+// The summary issue comment is created BEFORE the review so that on a cold
+// start (first review on the PR) it lands above the review in the timeline
+// (GitHub orders issue comments oldest-first). It is then updated in place
+// with the final body once the review has posted. This keeps the summary from
+// being sandwiched between review blocks on subsequent sticky runs.
+
+// Find the issue comment that should carry the summary, or null if none.
+// Sticky matches the persistent cross-run marker (SUMMARY_MARKER); non-sticky
+// matches this run's tag (SUMMARY_TAG) so each run gets its own comment while
+// retries within a run reuse it. Throws on read failure so callers can degrade.
+async function findSummaryIssueComment({ github, owner, repo, prNumber, sticky, tag, log }) {
+  const comments = await readAllPages("listIssueComments", (page, per_page) =>
+    github.rest.issues.listComments({ owner, repo, issue_number: prNumber, per_page, page }), log
+  );
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i].body || "";
+    if (sticky ? body.includes(SUMMARY_MARKER) : body.includes(tag)) {
+      return comments[i];
+    }
+  }
+  return null;
+}
+
+// Phase 1 (before review): create a summary comment only if none exists yet, so
+// its timeline position is pinned above the not-yet-posted review. Returns
+// { id, url } for the existing/created comment, or null when the existence
+// check fails (read API unavailable) — callers then defer to finalizeSummary.
+async function ensureSummaryAnchor({ github, owner, repo, prNumber, body, sticky, tag, log }) {
+  let existing = null;
+  try {
+    existing = await findSummaryIssueComment({ github, owner, repo, prNumber, sticky, tag, log });
+  } catch (e) {
+    log(`[summary] cannot check for existing summary before review (${e.message}); skipping anchor.`);
+    return null;
+  }
+  if (existing) {
+    return { id: existing.id, url: existing.html_url };
+  }
+  const { data: created } = await github.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: prNumber,
+    body,
+  });
+  return { id: created.id, url: created.html_url };
+}
+
+// Phase 2 (after review): write the final summary body. When the anchor's id is
+// known, update it directly (no extra read). Otherwise upsert: find then update
+// or create. Returns { id, url }, or null when the read API is unavailable and
+// the summary cannot be safely written without risking a duplicate.
+async function finalizeSummary({ github, owner, repo, prNumber, anchor, body, sticky, tag, log }) {
+  if (anchor && anchor.id != null) {
+    const { data: updated } = await github.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: anchor.id,
+      body,
+    });
+    return { id: updated.id, url: updated.html_url };
+  }
+  let existing = null;
+  try {
+    existing = await findSummaryIssueComment({ github, owner, repo, prNumber, sticky, tag, log });
+  } catch (e) {
+    log(`[summary] cannot check for existing summary at finalize (${e.message}); skipping to avoid duplicate.`);
+    return null;
+  }
+  if (existing) {
+    const { data: updated } = await github.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: existing.id,
+      body,
+    });
+    return { id: updated.id, url: updated.html_url };
+  }
+  const { data: created } = await github.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: prNumber,
+    body,
+  });
+  return { id: created.id, url: created.html_url };
 }
 
 // ---- Incremental helpers ----
@@ -951,6 +1035,23 @@ function buildSummaryBody(totalCount, inlineCount, summaryCount, warnings) {
   return body;
 }
 
+// Pre-review summary body: shown in the anchor comment while inline comments
+// are being posted. Includes only what is known before the review lands (issue
+// count, warnings, comments without line info) — final posting statistics are
+// added by the finalize phase. Kept informative (not an empty placeholder) so
+// the summary is useful even if the run is interrupted before finalize.
+function buildPreReviewSummaryBody(totalCount, summaryComments, warnings) {
+  let body = `🔍 **OpenCodeReview** found **${totalCount}** issue(s) in this PR.`;
+  if (totalCount > 0) {
+    body += `\n- ⏳ _Posting review comments…_`;
+  }
+  if (warnings.length > 0) {
+    body += `\n\n⚠️ ${warnings.length} warning(s) occurred during review.`;
+  }
+  body += formatSummaryComments(summaryComments);
+  return body;
+}
+
 function formatSummaryComments(summaryComments) {
   let body = "";
   for (const { comment } of summaryComments) {
@@ -986,6 +1087,9 @@ module.exports = {
   runPostReviewComments,
   postSummary,
   findExistingSummaryComment,
+  findSummaryIssueComment,
+  ensureSummaryAnchor,
+  finalizeSummary,
   listExistingReviewComments,
   getAuthenticatedLogin,
   isBotComment,
@@ -1006,6 +1110,7 @@ module.exports = {
   formatComment,
   formatCommentMarkdown,
   buildSummaryBody,
+  buildPreReviewSummaryBody,
   formatSummaryComments,
   fencedBlock,
   safeFence,
