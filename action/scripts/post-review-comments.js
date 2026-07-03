@@ -189,16 +189,59 @@ async function runPostReviewComments({
       logRateLimitQuota(batchRes, "after batch createReview", log);
     } catch (e) {
       log(`Failed to post review with inline comments: ${e.message}`);
-      log("Checking whether the batch review actually landed on the server before retrying...");
 
-      // Idempotency check: the batch createReview may have succeeded on the
-      // server even though we got a 5xx. Query existing reviews to find out,
-      // so we only retry the comments that are actually missing.
+      // Retry/pacing configuration (shared by write and read API calls).
+      // parseNonNegInt guards against nonsensical env values (negative, NaN,
+      // non-numeric) that `parseInt(...) || default` would let through for
+      // negative numbers, since a negative parseInt result is truthy and would
+      // bypass the `|| default` fallback.
+      const MAX_RETRIES = parseNonNegInt(process.env.OCR_MAX_RETRIES, 3);
+      const SUCCESS_DELAY = parseNonNegInt(process.env.OCR_SUCCESS_DELAY, 2000);
+      const FAILURE_DELAY = parseNonNegInt(process.env.OCR_FAILURE_DELAY, 1000);
+      const LOW_REMAINING_THRESHOLD = parseNonNegInt(process.env.OCR_LOW_REMAINING_THRESHOLD, 3);
+      const LOW_REMAINING_SPACING = parseNonNegInt(process.env.OCR_LOW_REMAINING_SPACING, 10000);
+      // Read APIs are cheaper and have higher thresholds; use shorter pacing.
+      const READ_SUCCESS_DELAY = parseNonNegInt(process.env.OCR_READ_SUCCESS_DELAY, 500);
+      const READ_LOW_REMAINING_SPACING = parseNonNegInt(process.env.OCR_READ_LOW_REMAINING_SPACING, 5000);
+
+      // Rate-limit cooldown: honor the batch error's retry/rate-limit headers
+      // BEFORE any further API call — including the idempotency reads below.
+      // Firing reads immediately after a rate-limit/5xx would further pressure
+      // the already-struggling API; this is the same cool-down-before-read
+      // discipline the per-comment loop applies before isCommentAlreadyPosted.
+      const batchRetry = computeRetryDelayMs(e, 0);
+      if (batchRetry != null) {
+        const secs = (batchRetry.delayMs / 1000).toFixed(1);
+        log(
+          `Batch createReview failed (HTTP ${e.status}). ` +
+            `Cooling down ${secs}s via '${batchRetry.source}' (${batchRetry.detail}) before any retry or read.`
+        );
+        await sleep(batchRetry.delayMs);
+      }
+
+      // The idempotency read ("did the batch land?") is only meaningful when the
+      // request MAY have reached the server: 5xx, 408 timeout, or a network
+      // error with no status. For a pure rate-limit (429 / 403 abuse) or a
+      // validation error (422), the request was rejected before the review was
+      // created, so the batch definitely did not land — querying would be both
+      // pointless AND an extra read fired during a rate-limit episode. Skip it
+      // and retry all comments. This mirrors the per-comment maybeReachedServer
+      // predicate so the two layers stay consistent.
+      const batchStatus = e.status;
+      const batchMaybeReachedServer =
+        (typeof batchStatus === "number" && (batchStatus >= 500 || batchStatus === 408)) ||
+        batchStatus == null; // network errors (ECONNRESET, ETIMEDOUT, ...)
+
       let existingReview = null;
-      try {
-        existingReview = await findExistingBatchReview({ github, owner, repo, prNumber, tag: REVIEW_TAG, log });
-      } catch (checkErr) {
-        log(`Idempotency check failed (${checkErr.message}). Degrading to original fallback (accepting duplicate risk).`);
+      if (batchMaybeReachedServer) {
+        log("Checking whether the batch review actually landed on the server before retrying...");
+        try {
+          existingReview = await findExistingBatchReview({ github, owner, repo, prNumber, tag: REVIEW_TAG, log });
+        } catch (checkErr) {
+          log(`Idempotency check failed (${checkErr.message}). Degrading to original fallback (accepting duplicate risk).`);
+        }
+      } else {
+        log(`Batch did not reach the server (HTTP ${batchStatus || "n/a"}); skipping idempotency check and retrying all comments.`);
       }
 
       // Compute the list of inline comments that still need to be posted. If
@@ -216,33 +259,6 @@ async function runPostReviewComments({
         );
       } else {
         log("Batch review not found on server. Falling back to per-comment posting...");
-      }
-
-      // Retry/pacing configuration (shared by write and read API calls).
-      // parseNonNegInt guards against nonsensical env values (negative, NaN,
-      // non-numeric) that `parseInt(...) || default` would let through for
-      // negative numbers, since a negative parseInt result is truthy and would
-      // bypass the `|| default` fallback.
-      const MAX_RETRIES = parseNonNegInt(process.env.OCR_MAX_RETRIES, 3);
-      const SUCCESS_DELAY = parseNonNegInt(process.env.OCR_SUCCESS_DELAY, 2000);
-      const FAILURE_DELAY = parseNonNegInt(process.env.OCR_FAILURE_DELAY, 1000);
-      const LOW_REMAINING_THRESHOLD = parseNonNegInt(process.env.OCR_LOW_REMAINING_THRESHOLD, 3);
-      const LOW_REMAINING_SPACING = parseNonNegInt(process.env.OCR_LOW_REMAINING_SPACING, 10000);
-      // Read APIs are cheaper and have higher thresholds; use shorter pacing.
-      const READ_SUCCESS_DELAY = parseNonNegInt(process.env.OCR_READ_SUCCESS_DELAY, 500);
-      const READ_LOW_REMAINING_SPACING = parseNonNegInt(process.env.OCR_READ_LOW_REMAINING_SPACING, 5000);
-
-      // If the batch itself was rate-limited, honor its rate-limit headers
-      // before retrying per-comment, otherwise the first per-comment call
-      // re-hits the same wall immediately.
-      const batchRetry = computeRetryDelayMs(e, 0);
-      if (batchRetry != null) {
-        const secs = (batchRetry.delayMs / 1000).toFixed(1);
-        log(
-          `Batch createReview was rate-limited (HTTP ${e.status}). ` +
-            `Cooling down ${secs}s via '${batchRetry.source}' (${batchRetry.detail}) before per-comment retry.`
-        );
-        await sleep(batchRetry.delayMs);
       }
 
       for (const { comment, reviewComment, id } of toRetry) {
