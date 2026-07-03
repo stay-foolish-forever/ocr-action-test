@@ -501,12 +501,19 @@ async function listExistingReviewComments(github, owner, repo, prNumber, log) {
   let page = 1;
   // Cap pagination so a pathological PR cannot stall the job; 10 pages = 1000.
   const MAX_PAGES = 10;
+  // Sort newest-first so the page cap keeps the most recent comments: the
+  // incremental dedup cares about the latest coverage state, and on truncation
+  // we'd rather drop ancient comments than the recent ones the bot just posted.
+  // GitHub's default is ascending (oldest-first), which would keep the oldest
+  // 1000 and silently drop the newest — the exact comments dedup needs most.
   try {
     while (page <= MAX_PAGES) {
       const res = await github.rest.pulls.listReviewComments({
         owner,
         repo,
         pull_number: prNumber,
+        sort: "created",
+        direction: "desc",
         per_page: 100,
         page,
       });
