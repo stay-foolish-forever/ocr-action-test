@@ -252,6 +252,33 @@ async function testStickyUpdatesExistingSummary() {
   assert.strictEqual(outputs.summary_comment_url, "http://ex/u1");
 }
 
+// Non-sticky + batch fails (e.g. rate-limit) but the per-comment fallback then
+// succeeds for every comment. The summary was meant to ride in the batch review
+// body, which never landed, so a separate summary issue comment MUST still be
+// posted. Regression guard: previously failedCount===0 made the code think the
+// batch carried the summary and skip the separate comment, losing the summary.
+async function testNonStickyFallbackAllSuccessStillPostsSummary() {
+  const result = { comments: [{ path: "src/a.js", content: "comment A", start_line: 1, end_line: 1 }], warnings: [] };
+
+  const { github, outputs } = await run({
+    result,
+    githubOpts: {
+      // Batch fails (rate-limit)...
+      bulkError: "rate limited",
+      bulkErrorStatus: 429,
+      // ...but the per-comment fallback succeeds (no individualError).
+    },
+    opts: { stickySummary: false },
+  });
+
+  // batch (call #1, failed) + one per-comment retry (call #2, succeeded).
+  assert.strictEqual(github.createReviewCalls.length, 2, "batch + per-comment fallback");
+  assert.strictEqual(github.issueComments.length, 1, "summary still posted as issue comment since batch body never landed");
+  assert.strictEqual(github.updatedComments.length, 0, "non-sticky never updates");
+  assert.strictEqual(outputs.comments_inline, "1");
+  assert.strictEqual(outputs.comments_failed, "0");
+}
+
 async function testNonStickyCreatesNewCommentOnFallback() {
   const result = { comments: [{ path: "src/a.js", content: "Failed inline content.", start_line: 10, end_line: 10 }], warnings: [] };
 
@@ -514,6 +541,7 @@ async function main() {
   await testErrorCommentUsesSafeFence();
   await testStickyUpdatesExistingSummary();
   await testNonStickyCreatesNewCommentOnFallback();
+  await testNonStickyFallbackAllSuccessStillPostsSummary();
   await testNoCommentsStickyUpdate();
   await testIncrementalSkipsOverlapping();
   await testIncrementalAllOverlapPostsNoReview();

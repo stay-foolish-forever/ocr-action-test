@@ -153,6 +153,12 @@ async function runPostReviewComments({
   let successCount = 0;
   let failedCount = 0;
   const failedComments = [];
+  // True only when the single batch createReview (which, in non-sticky mode,
+  // carries the summary in its body) actually landed. Distinct from "all inline
+  // comments eventually posted": a batch may fail (e.g. rate-limit) while the
+  // per-comment fallback then succeeds, in which case the summary body never
+  // landed and a separate summary comment is still required.
+  let batchReviewSucceeded = false;
 
   if (toSend.length > 0) {
     // When sticky, the summary lives in an updatable issue comment, so the
@@ -178,6 +184,7 @@ async function runPostReviewComments({
         comments: toSend.map(({ reviewComment }) => reviewComment),
       });
       successCount = toSend.length;
+      batchReviewSucceeded = true;
       log(`Successfully posted review with ${successCount} inline comment(s) (${commentsWithoutLine.length} in summary).`);
       logRateLimitQuota(batchRes, "after batch createReview", log);
     } catch (e) {
@@ -380,11 +387,14 @@ async function runPostReviewComments({
     extraStats.push(`\n- ❌ Failed to post: ${failedCount} comment(s)`);
   }
 
-  // Non-sticky legacy behavior: when the batch review succeeded with inline
-  // comments, the summary already rides in the review body, so no separate
-  // issue comment is needed. Otherwise (sticky, fallback, or no inline to
-  // attach the body to) post a separate summary comment.
-  const batchSucceededWithInline = toSend.length > 0 && failedCount === 0;
+  // Non-sticky legacy behavior: the summary rides in the batch review body, so
+  // a separate issue comment is needed only when that batch did NOT land
+  // (sticky, fallback after batch failure, or no inline to attach the body to).
+  // Note this keys off batchReviewSucceeded, not failedCount: a batch may fail
+  // (e.g. rate-limit) while the per-comment fallback then succeeds (failedCount
+  // stays 0), in which case the summary body was never posted and must be
+  // recovered via a separate comment.
+  const batchSucceededWithInline = batchReviewSucceeded && toSend.length > 0;
   const needsSeparateSummary = stickySummary || !batchSucceededWithInline;
 
   if (needsSeparateSummary) {
