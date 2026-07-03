@@ -1155,6 +1155,7 @@ module.exports = {
   sameCommentSpan,
   resolveThreshold,
   rangeOf,
+  DEFAULT_OVERLAP_THRESHOLD,
   computeRetryDelayMs,
   getHeader,
   logRateLimitQuota,

@@ -12,7 +12,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, rangeOf, lineSpan, sameCommentSpan, overlapsHistory, newCommentId, getPostedCommentIds, computeRetryDelayMs } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, rangeOf, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs } = require(path.join(__dirname, "post-review-comments.js"));
 
 // Make all retry/pacing delays effectively zero so tests run fast.
 // NOTE: computeRetryDelayMs reads OCR_RETRY_MAX_DELAY / OCR_RETRY_BASE_DELAY
@@ -450,6 +450,61 @@ async function testIncrementalAllOverlapPostsNoReview() {
   assert.strictEqual(github.issueComments.length, 1, "summary anchor created");
   assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with status body");
   assert.match(github.updatedComments[0].body, /nothing new was posted/);
+  assert.strictEqual(outputs.comments_skipped, "1");
+  assert.strictEqual(outputs.comments_inline, "0");
+}
+
+// Multi-line IoU dedup end-to-end at the default threshold (0.6). History
+// covers [8,10]; of the three new multi-line comments, the identical span
+// (IoU 1.0) is skipped while the low-IoU one (0.5) and a different file are
+// posted. Also verifies a single-line comment is NOT suppressed by a prior
+// multi-line block on an overlapping line.
+async function testIncrementalMultiLineIoUDefaultThreshold() {
+  const history = [{ path: "src/a.js", line: 10, start_line: 8, side: "RIGHT", user: { login: "github-actions[bot]" } }];
+  const result = {
+    comments: [
+      { path: "src/a.js", content: "identical", start_line: 8, end_line: 10 }, // IoU 1.0 -> skipped
+      { path: "src/a.js", content: "low-iou", start_line: 9, end_line: 11 }, // IoU 0.5 -> posted
+      { path: "src/a.js", content: "single", start_line: 9, end_line: 9 }, // single vs multi -> posted
+      { path: "src/b.js", content: "new", start_line: 1, end_line: 3 }, // other file -> posted
+    ],
+    warnings: [],
+  };
+
+  const { github, outputs } = await run({
+    result,
+    githubOpts: { history },
+    opts: { stickySummary: true, incremental: true },
+  });
+
+  assert.strictEqual(github.createReviewCalls.length, 1, "one batch review");
+  const sent = github.createReviewCalls[0].comments;
+  assert.strictEqual(sent.length, 3, "identical multi-line span skipped, rest posted");
+  const aJsLow = sent.find((c) => c.path === "src/a.js" && c.start_line === 9 && c.line === 11);
+  const aJsSingle = sent.find((c) => c.path === "src/a.js" && c.line === 9 && c.start_line == null);
+  assert.ok(aJsLow, "low-IoU multi-line comment was posted");
+  assert.ok(aJsSingle, "single-line comment was not suppressed by multi-line history");
+  assert.strictEqual(outputs.comments_skipped, "1");
+  assert.strictEqual(outputs.comments_inline, "3");
+}
+
+// Threshold propagation: lowering incrementalOverlapThreshold to 0.4 makes the
+// previously low-IoU span (0.5) now overlap, so it is skipped. Exercises the
+// runPostReviewComments -> overlapsHistory wiring end-to-end.
+async function testIncrementalOverlapThresholdPropagated() {
+  const history = [{ path: "src/a.js", line: 10, start_line: 8, side: "RIGHT", user: { login: "github-actions[bot]" } }];
+  const result = {
+    comments: [{ path: "src/a.js", content: "low-iou", start_line: 9, end_line: 11 }], // IoU 0.5
+    warnings: [],
+  };
+
+  const { github, outputs } = await run({
+    result,
+    githubOpts: { history },
+    opts: { stickySummary: true, incremental: true, incrementalOverlapThreshold: 0.4 },
+  });
+
+  assert.strictEqual(github.createReviewCalls.length, 0, "no review posted (0.5 > 0.4 now overlaps)");
   assert.strictEqual(outputs.comments_skipped, "1");
   assert.strictEqual(outputs.comments_inline, "0");
 }
@@ -1078,6 +1133,16 @@ function testLineSpan() {
   // start_line === line collapses to a single-line span.
   assert.deepStrictEqual(lineSpan({ line: 9, start_line: 9 }), { start: 9, end: 9, multiline: false });
   assert.strictEqual(lineSpan({}), null);
+  // Invalid line numbers (0, negative, NaN) are dropped by num(); a span with
+  // no usable line resolves to null.
+  assert.strictEqual(lineSpan({ line: 0 }), null);
+  assert.strictEqual(lineSpan({ line: -3 }), null);
+  assert.strictEqual(lineSpan({ line: NaN }), null);
+  // An invalid start_line but valid line degrades to a single-line span.
+  assert.deepStrictEqual(lineSpan({ line: 5, start_line: 0 }), { start: 5, end: 5, multiline: false });
+  assert.deepStrictEqual(lineSpan({ line: 5, start_line: -1 }), { start: 5, end: 5, multiline: false });
+  // Reversed order (start_line > line) is normalized via min/max.
+  assert.deepStrictEqual(lineSpan({ line: 3, start_line: 8 }), { start: 3, end: 8, multiline: true });
 }
 
 function testSameCommentSpan() {
@@ -1101,6 +1166,31 @@ function testSameCommentSpan() {
   // IoU comparison is strict: exactly at the threshold is NOT a match.
   // [8,10] vs [9,11] => IoU 0.5; threshold 0.5 => 0.5 > 0.5 is false.
   assert.strictEqual(sameCommentSpan(ml(8, 10), ml(9, 11), 0.5), false);
+  // Single-line matching (rule 2) ignores threshold entirely: same line still
+  // matches even at threshold = 1.
+  assert.strictEqual(sameCommentSpan(sl(9), sl(9), 1), true);
+  // threshold = 1 is unreachable for multi-line under strict >: even identical
+  // spans (IoU 1) do not satisfy 1 > 1, so nothing ever matches. Locks the
+  // strict-> semantics.
+  assert.strictEqual(sameCommentSpan(ml(8, 10), ml(8, 10), 1), false);
+}
+
+function testResolveThreshold() {
+  // Valid values in (0, 1] pass through unchanged.
+  assert.strictEqual(resolveThreshold(0.6), 0.6);
+  assert.strictEqual(resolveThreshold(0.5), 0.5);
+  assert.strictEqual(resolveThreshold(1), 1);
+  // Numeric strings are accepted (mirrors parseFloat(action input)).
+  assert.strictEqual(resolveThreshold("0.4"), 0.4);
+  // Out-of-range values fall back to the default.
+  assert.strictEqual(resolveThreshold(0), DEFAULT_OVERLAP_THRESHOLD);
+  assert.strictEqual(resolveThreshold(-0.5), DEFAULT_OVERLAP_THRESHOLD);
+  assert.strictEqual(resolveThreshold(1.5), DEFAULT_OVERLAP_THRESHOLD);
+  // Non-numeric / missing values fall back to the default.
+  assert.strictEqual(resolveThreshold(NaN), DEFAULT_OVERLAP_THRESHOLD);
+  assert.strictEqual(resolveThreshold("abc"), DEFAULT_OVERLAP_THRESHOLD);
+  assert.strictEqual(resolveThreshold(undefined), DEFAULT_OVERLAP_THRESHOLD);
+  assert.strictEqual(resolveThreshold(null), DEFAULT_OVERLAP_THRESHOLD);
 }
 
 function testOverlapsHistory() {
@@ -1121,6 +1211,27 @@ function testOverlapsHistory() {
   assert.strictEqual(overlapsHistory({ path: "b.js", line: 10, start_line: 8, side: "RIGHT" }, ml), false);
   const leftHist = [{ path: "a.js", line: 10, start_line: 8, side: "LEFT" }];
   assert.strictEqual(overlapsHistory({ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }, leftHist), false);
+  // An unresolvable current comment (no usable line) never overlaps.
+  assert.strictEqual(overlapsHistory({ path: "a.js", side: "RIGHT" }, ml), false);
+  // Unresolvable history entries are skipped, not fatal: a later valid entry
+  // on the same path can still match.
+  const mixedHist = [
+    { path: "a.js", side: "RIGHT" }, // no line info -> lineSpan null
+    { path: "a.js", line: 9, side: "RIGHT" }, // single-line 9
+  ];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 9, side: "RIGHT" }, mixedHist), true);
+  // Any-of semantics: multiple history entries, a match on any one wins.
+  const multiHist = [
+    { path: "a.js", line: 5, start_line: 5, side: "RIGHT" }, // no match
+    { path: "a.js", line: 10, start_line: 8, side: "RIGHT" }, // matches [8,10]
+  ];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 10, start_line: 8, side: "RIGHT" }, multiHist), true);
+  // A history entry with no side field still participates (falsy side bypasses
+  // the RIGHT-only guard).
+  const noSideHist = [{ path: "a.js", line: 9 }];
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 9, start_line: 9, side: "RIGHT" }, noSideHist), true);
+  // An invalid threshold falls back to the default (IoU 0.5 < 0.6 -> no match).
+  assert.strictEqual(overlapsHistory({ path: "a.js", line: 11, start_line: 9, side: "RIGHT" }, ml, "garbage"), false);
 }
 
 async function main() {
@@ -1132,6 +1243,8 @@ async function main() {
   await testNoCommentsStickyUpdate();
   await testIncrementalSkipsOverlapping();
   await testIncrementalAllOverlapPostsNoReview();
+  await testIncrementalMultiLineIoUDefaultThreshold();
+  await testIncrementalOverlapThresholdPropagated();
   // Idempotency
   await testBatchLandedRetriesOnlyMissingComments();
   await testPerComment5xxAlreadyPostedTreatedAsSuccess();
@@ -1157,6 +1270,7 @@ async function main() {
   testRangeOf();
   testLineSpan();
   testSameCommentSpan();
+  testResolveThreshold();
   testOverlapsHistory();
   testNewCommentIdFormat();
   console.log("All post-review-comments tests passed.");
