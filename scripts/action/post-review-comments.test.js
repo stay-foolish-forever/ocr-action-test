@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 "use strict";
 
-// Unit tests for scripts/post-review-comments.js.
+// Unit tests for scripts/action/post-review-comments.js.
 //
-// Run via: node scripts/post-review-comments.test.js
+// Run via: node scripts/action/post-review-comments.test.js
 // (also wired as `npm run test:github-actions`).
 //
 // These tests drive runPostReviewComments directly with an injected mock

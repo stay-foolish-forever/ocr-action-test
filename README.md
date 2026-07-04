@@ -18,7 +18,7 @@ A reusable GitHub Action that runs [OpenCodeReview](https://github.com/alibaba/o
 3. Installs OCR via npm and configures the LLM endpoint through environment variables (highest priority) plus `ocr config set llm.extra_body`.
 4. Runs `ocr review --from <merge-base> --to <head> --format json`.
 5. Uploads the raw JSON result and stderr as workflow artifacts.
-6. Posts inline review comments and a summary via `actions/github-script`, using the shared module at `scripts/post-review-comments.js`.
+6. Posts inline review comments and a summary via `actions/github-script`, using the shared module at `scripts/action/post-review-comments.js`.
 
 ## Usage
 

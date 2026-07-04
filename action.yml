@@ -216,7 +216,7 @@ runs:
       with:
         github-token: ${{ inputs.github_token }}
         script: |
-          const { runPostReviewComments } = require(`${{ github.action_path }}/scripts/post-review-comments.js`);
+          const { runPostReviewComments } = require(`${{ github.action_path }}/scripts/action/post-review-comments.js`);
           await runPostReviewComments({
             github,
             context,
