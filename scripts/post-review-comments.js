@@ -433,6 +433,7 @@ async function runPostReviewComments({
   if (toSend.length === 0 && stats.skipped > 0) {
     summaryBody += "\n\n---\n\nℹ️ All inline comments overlapped with existing reviews; nothing new was posted.";
   }
+  summaryBody += formatWarnings(warnings);
 
   // Update the anchored comment directly when its id is known (no extra read);
   // otherwise upsert (find-then-update-or-create), which also covers the case
@@ -1106,6 +1107,7 @@ function buildPreReviewSummaryBody(totalCount, summaryComments, warnings) {
     body += `\n\n⚠️ ${warnings.length} warning(s) occurred during review.`;
   }
   body += formatSummaryComments(summaryComments);
+  body += formatWarnings(warnings);
   return body;
 }
 
@@ -1116,6 +1118,34 @@ function formatSummaryComments(summaryComments) {
     body += formatCommentMarkdown(comment);
   }
   return body;
+}
+
+// Render the warning contents as a bulleted list under a "⚠️ Warnings" heading.
+// Returns "" when there are no warnings, so callers can append unconditionally.
+// Each warning may be a plain string or an object carrying a `message` field
+// (the two shapes the OCR result emits); anything else falls back to a stable
+// stringification so the summary always surfaces *what* went wrong.
+function formatWarnings(warnings) {
+  if (!warnings || warnings.length === 0) return "";
+  let body = "\n\n---\n\n### ⚠️ Warnings";
+  for (const w of warnings) {
+    body += `\n- ${warningText(w)}`;
+  }
+  return body;
+}
+
+function warningText(w) {
+  if (w == null) return "";
+  if (typeof w === "string") return w;
+  if (typeof w === "object") {
+    if (w.message != null) return String(w.message);
+    try {
+      return JSON.stringify(w);
+    } catch (_) {
+      return String(w);
+    }
+  }
+  return String(w);
 }
 
 function fencedBlock(content, language = "") {
@@ -1173,6 +1203,7 @@ module.exports = {
   buildSummaryBody,
   buildPreReviewSummaryBody,
   formatSummaryComments,
+  formatWarnings,
   fencedBlock,
   safeFence,
   SUMMARY_MARKER,

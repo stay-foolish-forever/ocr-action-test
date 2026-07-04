@@ -12,7 +12,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, rangeOf, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, rangeOf, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings } = require(path.join(__dirname, "post-review-comments.js"));
 
 // Make all retry/pacing delays effectively zero so tests run fast.
 // NOTE: computeRetryDelayMs reads OCR_RETRY_MAX_DELAY / OCR_RETRY_BASE_DELAY
@@ -321,6 +321,48 @@ async function testFailedInlineCommentsAreSummarized() {
   assert.match(body, /No-line content with a fenced block/);
   assert.match(body, /Failed inline content must remain visible/);
   assert.match(body, /Line could not be resolved/);
+}
+
+async function testWarningsListedAfterSummaryComments() {
+  const result = {
+    comments: [
+      { path: "src/a.js", content: "Inline comment content.", start_line: 1, end_line: 1 },
+      { path: "docs/no-line.md", content: "No-line comment content.", start_line: 0, end_line: 0 },
+    ],
+    warnings: [
+      "file too large to review fully",
+      { message: "skipped binary asset assets/logo.png" },
+    ],
+  };
+
+  const { github } = await run({ result, opts: { stickySummary: true } });
+
+  assert.strictEqual(github.updatedComments.length, 1, "anchor finalized with the full body");
+  const body = github.updatedComments[0].body;
+  // Both the count line and the detailed list must be present...
+  assert.match(body, /2 warning\(s\) occurred during review/);
+  assert.match(body, /### ⚠️ Warnings/);
+  assert.match(body, /file too large to review fully/);
+  assert.match(body, /skipped binary asset assets\/logo\.png/);
+  // ...and the list must come AFTER the non-inline (no-line) review comment.
+  const noLineIdx = body.indexOf("No-line comment content.");
+  const warningsIdx = body.indexOf("### ⚠️ Warnings");
+  assert.ok(noLineIdx !== -1 && warningsIdx > noLineIdx, "warnings list placed after summary comments");
+  // The pre-review anchor body must also surface the warning contents.
+  assert.match(github.issueComments[0].body, /skipped binary asset assets\/logo\.png/);
+}
+
+function testFormatWarnings() {
+  assert.strictEqual(formatWarnings([]), "");
+  assert.strictEqual(formatWarnings(null), "");
+  assert.strictEqual(formatWarnings(undefined), "");
+  // Plain string warnings.
+  assert.match(formatWarnings(["a", "b"]), /### ⚠️ Warnings/);
+  assert.match(formatWarnings(["a", "b"]), /\n- a\n- b/);
+  // Object warnings expose their `message`.
+  assert.match(formatWarnings([{ message: "boom" }]), /\n- boom/);
+  // Unknown object shapes degrade to a stable JSON stringification.
+  assert.match(formatWarnings([{ code: 42 }]), /\n- \{"code":42\}/);
 }
 
 async function testErrorCommentUsesSafeFence() {
@@ -1236,6 +1278,7 @@ function testOverlapsHistory() {
 
 async function main() {
   await testFailedInlineCommentsAreSummarized();
+  await testWarningsListedAfterSummaryComments();
   await testErrorCommentUsesSafeFence();
   await testStickyUpdatesExistingSummary();
   await testNonStickyCreatesNewCommentOnFallback();
@@ -1267,6 +1310,7 @@ async function main() {
   await testBatchReadRateLimitRetriedViaWithRetry();
   // Pure helpers
   testSafeFenceAndFencedBlock();
+  testFormatWarnings();
   testRangeOf();
   testLineSpan();
   testSameCommentSpan();
