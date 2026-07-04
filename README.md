@@ -3,7 +3,7 @@
 A reusable GitHub Action that runs [OpenCodeReview](https://github.com/alibaba/open-code-review) on a pull request and posts inline review comments with a sticky summary. Other repositories can adopt AI-powered PR review with a single `uses:` step.
 
 ```yaml
-- uses: alibaba/open-code-review/action@v1
+- uses: stay-foolish-forever/ocr-action-test@v1
   with:
     llm_url: ${{ secrets.OCR_LLM_URL }}
     llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
@@ -18,7 +18,7 @@ A reusable GitHub Action that runs [OpenCodeReview](https://github.com/alibaba/o
 3. Installs OCR via npm and configures the LLM endpoint through environment variables (highest priority) plus `ocr config set llm.extra_body`.
 4. Runs `ocr review --from <merge-base> --to <head> --format json`.
 5. Uploads the raw JSON result and stderr as workflow artifacts.
-6. Posts inline review comments and a summary via `actions/github-script`, using the shared module at `action/scripts/post-review-comments.js`.
+6. Posts inline review comments and a summary via `actions/github-script`, using the shared module at `scripts/post-review-comments.js`.
 
 ## Usage
 
@@ -39,7 +39,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: alibaba/open-code-review/action@v1
+      - uses: stay-foolish-forever/ocr-action-test@v1
         with:
           llm_url: ${{ secrets.OCR_LLM_URL }}
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
@@ -52,7 +52,7 @@ jobs:
 For `issue_comment` triggers, resolve the PR context first and pass it in:
 
 ```yaml
-- uses: alibaba/open-code-review/action@v1
+- uses: stay-foolish-forever/ocr-action-test@v1
   with:
     llm_url: ${{ secrets.OCR_LLM_URL }}
     llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
@@ -168,6 +168,6 @@ By default comments are posted as `github-actions[bot]`. To post as a GitHub App
 Pin to a major version to auto-receive fixes within v1, or pin to a commit SHA for the strictest reproducibility:
 
 ```yaml
-- uses: alibaba/open-code-review/action@v1
-- uses: alibaba/open-code-review/action@<commit-sha>
+- uses: stay-foolish-forever/ocr-action-test@v1
+- uses: stay-foolish-forever/ocr-action-test@<commit-sha>
 ```
