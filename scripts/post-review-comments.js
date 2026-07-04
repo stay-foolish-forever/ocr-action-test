@@ -16,6 +16,12 @@ const crypto = require("crypto");
 
 const SUMMARY_MARKER = "<!-- ocr-summary -->";
 
+// Reason attached to comments that have no valid line range and therefore can
+// never be posted as inline comments. Surfaced in the summary via the same
+// `⚠️ GitHub could not post this as an inline comment: <reason>` line as
+// posting failures, so every summary-only comment explains why it is here.
+const NO_LINE_REASON = "No line information provided";
+
 // Default IoU threshold for the incremental multi-line overlap test. Two
 // multi-line comments are considered the same when their line-range
 // intersection-over-union exceeds this value. Exposed for tuning via the
@@ -121,7 +127,7 @@ async function runPostReviewComments({
   for (const comment of comments) {
     const hasValidLine = comment.start_line >= 1 || comment.end_line >= 1;
     if (!hasValidLine) {
-      commentsWithoutLine.push({ comment, body: formatComment(comment) });
+      commentsWithoutLine.push({ comment, body: formatComment(comment), reason: NO_LINE_REASON });
       continue;
     }
     const id = newCommentId(RUN_TAG);
@@ -407,10 +413,16 @@ async function runPostReviewComments({
 
   // ---- Finalize the summary with the complete body ----
   // Now that the review has landed (or failed per-comment), write the final
-  // summary body: inline/skipped/failed counts and any comments that could not
-  // be posted inline (so they remain visible in the summary).
+  // summary body. All comments that did not go out as inline — whether because
+  // they had no line info or because posting failed — are rendered as one
+  // continuous block BEFORE the posting statistics, each carrying the reason it
+  // ended up in the summary (so the reader always knows why it is here).
   let summaryBody = buildSummaryBody(stats.total, successCount, commentsWithoutLine.length + failedComments.length, warnings);
   summaryBody += formatSummaryComments(commentsWithoutLine);
+  for (const { comment, error } of failedComments) {
+    summaryBody += "\n\n---\n\n";
+    summaryBody += formatCommentMarkdown(comment, error);
+  }
 
   const extraStats = [];
   extraStats.push(`\n- ✅ Successfully posted: ${successCount} comment(s)`);
@@ -422,13 +434,6 @@ async function runPostReviewComments({
   }
   if (extraStats.length > 0) {
     summaryBody += `\n\n---\n\n📊 **Posting Statistics:**` + extraStats.join("");
-  }
-  if (failedComments.length > 0) {
-    summaryBody += "\n\n---\n\n### ⚠️ Inline comments shown in summary";
-    for (const { comment, error } of failedComments) {
-      summaryBody += "\n\n---\n\n";
-      summaryBody += formatCommentMarkdown(comment, error);
-    }
   }
   if (toSend.length === 0 && stats.skipped > 0) {
     summaryBody += "\n\n---\n\nℹ️ All inline comments overlapped with existing reviews; nothing new was posted.";
@@ -1113,32 +1118,42 @@ function buildPreReviewSummaryBody(totalCount, summaryComments, warnings) {
 
 function formatSummaryComments(summaryComments) {
   let body = "";
-  for (const { comment } of summaryComments) {
+  for (const { comment, reason } of summaryComments) {
     body += "\n\n---\n\n";
-    body += formatCommentMarkdown(comment);
+    body += formatCommentMarkdown(comment, reason);
   }
   return body;
 }
 
 // Render the warning contents as a bulleted list under a "⚠️ Warnings" heading.
 // Returns "" when there are no warnings, so callers can append unconditionally.
-// Each warning may be a plain string or an object carrying a `message` field
-// (the two shapes the OCR result emits); anything else falls back to a stable
-// stringification so the summary always surfaces *what* went wrong.
+// OCR warning objects carry `file`, `message`, and `type`; each present field is
+// surfaced so the summary shows where/why the warning happened. Plain-string
+// warnings (and any unknown shape) degrade gracefully to their textual form.
 function formatWarnings(warnings) {
   if (!warnings || warnings.length === 0) return "";
-  let body = "\n\n---\n\n### ⚠️ Warnings";
+  let body = "\n\n---\n\n⚠️ **Warnings:**";
   for (const w of warnings) {
-    body += `\n- ${warningText(w)}`;
+    body += `\n- ${formatWarningEntry(w)}`;
   }
   return body;
 }
 
-function warningText(w) {
+// Format a single warning as a compact bullet. Builds a `file (type): message`
+// prefix from whichever of file/type are present, then appends the message.
+// Missing fields are skipped so a partial warning still reads naturally.
+function formatWarningEntry(w) {
   if (w == null) return "";
   if (typeof w === "string") return w;
   if (typeof w === "object") {
-    if (w.message != null) return String(w.message);
+    const prefixParts = [];
+    if (w.file != null && String(w.file) !== "") prefixParts.push(`\`${w.file}\``);
+    if (w.type != null && String(w.type) !== "") prefixParts.push(`(\`${w.type}\`)`);
+    const prefix = prefixParts.join(" ");
+    const msg = w.message != null ? String(w.message) : "";
+    if (prefix && msg) return `${prefix}: ${msg}`;
+    if (msg) return msg;
+    if (prefix) return prefix;
     try {
       return JSON.stringify(w);
     } catch (_) {
@@ -1207,4 +1222,5 @@ module.exports = {
   fencedBlock,
   safeFence,
   SUMMARY_MARKER,
+  NO_LINE_REASON,
 };

@@ -321,6 +321,16 @@ async function testFailedInlineCommentsAreSummarized() {
   assert.match(body, /No-line content with a fenced block/);
   assert.match(body, /Failed inline content must remain visible/);
   assert.match(body, /Line could not be resolved/);
+  // The no-line comment now carries the same reason line as a posting failure.
+  assert.match(body, /GitHub could not post this as an inline comment: No line information provided/);
+  // The old grouping heading is gone, and both summary comments appear in one
+  // continuous block BEFORE the Posting Statistics section.
+  assert.doesNotMatch(body, /Inline comments shown in summary/);
+  const statsIdx = body.indexOf("📊 **Posting Statistics:**");
+  const noLineIdx = body.indexOf("No-line content with a fenced block");
+  const failedIdx = body.indexOf("Failed inline content must remain visible");
+  assert.ok(statsIdx > noLineIdx, "no-line comment rendered before statistics");
+  assert.ok(statsIdx > failedIdx, "failed comment rendered before statistics");
 }
 
 async function testWarningsListedAfterSummaryComments() {
@@ -331,7 +341,7 @@ async function testWarningsListedAfterSummaryComments() {
     ],
     warnings: [
       "file too large to review fully",
-      { message: "skipped binary asset assets/logo.png" },
+      { file: "assets/logo.png", message: "skipped binary asset", type: "binary_asset" },
     ],
   };
 
@@ -341,15 +351,16 @@ async function testWarningsListedAfterSummaryComments() {
   const body = github.updatedComments[0].body;
   // Both the count line and the detailed list must be present...
   assert.match(body, /2 warning\(s\) occurred during review/);
-  assert.match(body, /### ⚠️ Warnings/);
+  assert.match(body, /⚠️ \*\*Warnings:\*\*/);
   assert.match(body, /file too large to review fully/);
-  assert.match(body, /skipped binary asset assets\/logo\.png/);
+  // Object warnings surface file, type, and message.
+  assert.match(body, /`assets\/logo\.png` \(`binary_asset`\): skipped binary asset/);
   // ...and the list must come AFTER the non-inline (no-line) review comment.
   const noLineIdx = body.indexOf("No-line comment content.");
-  const warningsIdx = body.indexOf("### ⚠️ Warnings");
+  const warningsIdx = body.indexOf("⚠️ **Warnings:**");
   assert.ok(noLineIdx !== -1 && warningsIdx > noLineIdx, "warnings list placed after summary comments");
   // The pre-review anchor body must also surface the warning contents.
-  assert.match(github.issueComments[0].body, /skipped binary asset assets\/logo\.png/);
+  assert.match(github.issueComments[0].body, /`assets\/logo\.png` \(`binary_asset`\): skipped binary asset/);
 }
 
 function testFormatWarnings() {
@@ -357,10 +368,17 @@ function testFormatWarnings() {
   assert.strictEqual(formatWarnings(null), "");
   assert.strictEqual(formatWarnings(undefined), "");
   // Plain string warnings.
-  assert.match(formatWarnings(["a", "b"]), /### ⚠️ Warnings/);
+  assert.match(formatWarnings(["a", "b"]), /⚠️ \*\*Warnings:\*\*/);
   assert.match(formatWarnings(["a", "b"]), /\n- a\n- b/);
-  // Object warnings expose their `message`.
+  // Object warnings surface file, type, and message together.
+  assert.match(
+    formatWarnings([{ file: "internal/llm/resolver.go", message: "context deadline exceeded", type: "subtask_error" }]),
+    /\n- `internal\/llm\/resolver\.go` \(`subtask_error`\): context deadline exceeded/
+  );
+  // Partial objects: only message.
   assert.match(formatWarnings([{ message: "boom" }]), /\n- boom/);
+  // Partial objects: file + message, no type.
+  assert.match(formatWarnings([{ file: "a.go", message: "m" }]), /\n- `a\.go`: m/);
   // Unknown object shapes degrade to a stable JSON stringification.
   assert.match(formatWarnings([{ code: 42 }]), /\n- \{"code":42\}/);
 }
